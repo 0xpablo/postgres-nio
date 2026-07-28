@@ -2,12 +2,12 @@
 import InMemoryTracing
 import Logging
 import NIOPosix
-import Testing
 import Tracing
+import XCTest
 
-@Suite(.serialized) struct PostgresClientTracingTests {
-    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
-    @Test func testQueryTracingIncludesLeaseWait() async throws {
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+final class PostgresClientTracingTests: XCTestCase {
+    func testQueryTracingIncludesLeaseWait() async throws {
         let tracer = InMemoryTracer()
         var rawLogger = Logger(label: "PostgresClientTracingTests")
         rawLogger.logLevel = .debug
@@ -48,22 +48,21 @@ import Tracing
             }
         }
 
-        let sleepSpan = try #require(tracer.finishedSpans.first(where: {
+        let sleepSpan = try XCTUnwrap(tracer.finishedSpans.first(where: {
             $0.attributes.stringValue(for: "db.query.text") == "SELECT pg_sleep(0.3);"
         }))
-        let secondSpan = try #require(tracer.finishedSpans.first(where: {
+        let secondSpan = try XCTUnwrap(tracer.finishedSpans.first(where: {
             $0.attributes.stringValue(for: "db.query.text") == "SELECT 1;"
         }))
 
-        #expect(sleepSpan.kind == SpanKind.client)
-        #expect(secondSpan.kind == SpanKind.client)
+        XCTAssertEqual(sleepSpan.kind, SpanKind.client)
+        XCTAssertEqual(secondSpan.kind, SpanKind.client)
 
         let duration = secondSpan.endInstant.nanosecondsSinceEpoch - secondSpan.startInstant.nanosecondsSinceEpoch
-        #expect(duration >= 200_000_000)
+        XCTAssertGreaterThanOrEqual(duration, 200_000_000)
     }
 
-    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
-    @Test func testTransactionTracingParentsDatabaseSpans() async throws {
+    func testTransactionTracingParentsDatabaseSpans() async throws {
         let tracer = InMemoryTracer()
         var rawLogger = Logger(label: "PostgresClientTracingTests")
         rawLogger.logLevel = .debug
@@ -92,25 +91,26 @@ import Tracing
             }
         }
 
-        let transactionSpan = try #require(tracer.finishedSpans.first(where: { $0.operationName == "postgres.transaction" }))
-        let beginSpan = try #require(tracer.finishedSpans.first(where: {
+        let transactionSpan = try XCTUnwrap(
+            tracer.finishedSpans.first(where: { $0.operationName == "postgres.transaction" })
+        )
+        let beginSpan = try XCTUnwrap(tracer.finishedSpans.first(where: {
             $0.attributes.stringValue(for: "db.query.text") == "BEGIN;"
         }))
-        let selectSpan = try #require(tracer.finishedSpans.first(where: {
+        let selectSpan = try XCTUnwrap(tracer.finishedSpans.first(where: {
             $0.attributes.stringValue(for: "db.query.text") == "SELECT 1;"
         }))
-        let commitSpan = try #require(tracer.finishedSpans.first(where: {
+        let commitSpan = try XCTUnwrap(tracer.finishedSpans.first(where: {
             $0.attributes.stringValue(for: "db.query.text") == "COMMIT;"
         }))
 
-        #expect(transactionSpan.kind == .internal)
-        #expect(beginSpan.parentSpanID == transactionSpan.spanID)
-        #expect(selectSpan.parentSpanID == transactionSpan.spanID)
-        #expect(commitSpan.parentSpanID == transactionSpan.spanID)
+        XCTAssertEqual(transactionSpan.kind, .internal)
+        XCTAssertEqual(beginSpan.parentSpanID, transactionSpan.spanID)
+        XCTAssertEqual(selectSpan.parentSpanID, transactionSpan.spanID)
+        XCTAssertEqual(commitSpan.parentSpanID, transactionSpan.spanID)
     }
 
-    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
-    @Test func testTransactionTracingFailsWhenLeaseFails() async throws {
+    func testTransactionTracingFailsWhenLeaseFails() async throws {
         let tracer = InMemoryTracer()
         var rawLogger = Logger(label: "PostgresClientTracingTests")
         rawLogger.logLevel = .debug
@@ -137,21 +137,22 @@ import Tracing
                     try await client.withTransaction(logger: logger) { _ in
                         ()
                     }
-                    Issue.record("Expected `withTransaction` to throw after client shutdown")
+                    XCTFail("Expected `withTransaction` to throw after client shutdown")
                 } catch {
                     // expected
                 }
             }
         }
 
-        let transactionSpan = try #require(tracer.finishedSpans.first(where: { $0.operationName == "postgres.transaction" }))
-        #expect(transactionSpan.kind == .internal)
-        #expect(transactionSpan.status?.code == .error)
-        #expect(transactionSpan.attributes["error.type"] != nil)
+        let transactionSpan = try XCTUnwrap(
+            tracer.finishedSpans.first(where: { $0.operationName == "postgres.transaction" })
+        )
+        XCTAssertEqual(transactionSpan.kind, .internal)
+        XCTAssertEqual(transactionSpan.status?.code, .error)
+        XCTAssertNotNil(transactionSpan.attributes["error.type"])
     }
 
-    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
-    @Test func testKeepAliveQueriesAreNotTraced() async throws {
+    func testKeepAliveQueriesAreNotTraced() async throws {
         let tracer = InMemoryTracer()
         var rawLogger = Logger(label: "PostgresClientTracingTests")
         rawLogger.logLevel = .debug
@@ -190,7 +191,11 @@ import Tracing
                 let resetRows = try await client.query(resetQuery, logger: logger).decode(String.self)
                 for try await _ in resetRows {}
 
-                #expect(try await self.waitForFinishedSpan(withQueryText: resetQuery.sql, in: tracer))
+                let didFinishResetSpan = try await self.waitForFinishedSpan(
+                    withQueryText: resetQuery.sql,
+                    in: tracer
+                )
+                XCTAssertTrue(didFinishResetSpan)
                 tracer.clearFinishedSpans()
 
                 try await Task.sleep(for: .milliseconds(250))
@@ -202,14 +207,21 @@ import Tracing
                     values.append(value)
                 }
 
-                #expect(try await self.waitForFinishedSpan(withQueryText: verifyQuery.sql, in: tracer))
+                let didFinishVerifySpan = try await self.waitForFinishedSpan(
+                    withQueryText: verifyQuery.sql,
+                    in: tracer
+                )
+                XCTAssertTrue(didFinishVerifySpan)
 
-                #expect(values == [keepAliveValue])
-                #expect(tracer.finishedSpans.count == 1)
-                #expect(tracer.finishedSpans.first?.attributes.stringValue(for: "db.query.text") == verifyQuery.sql)
-                #expect(tracer.finishedSpans.contains(where: {
+                XCTAssertEqual(values, [keepAliveValue])
+                XCTAssertEqual(tracer.finishedSpans.count, 1)
+                XCTAssertEqual(
+                    tracer.finishedSpans.first?.attributes.stringValue(for: "db.query.text"),
+                    verifyQuery.sql
+                )
+                XCTAssertFalse(tracer.finishedSpans.contains(where: {
                     $0.attributes.stringValue(for: "db.query.text") == keepAliveQuery.sql
-                }) == false)
+                }))
 
                 group.cancelAll()
             }
