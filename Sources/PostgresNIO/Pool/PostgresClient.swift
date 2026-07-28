@@ -380,7 +380,7 @@ public final class PostgresClient: Sendable, ServiceLifecycle.Service {
 
         do {
             return try await self.withConnection(isolation: isolation) { connection in
-                try await connection.withTraceContextOverride(span.context) {
+                try await connection.withTraceContextOverride(span.context, isolation: isolation) {
                     do {
                         let result = try await connection._withTransactionUntraced(
                             logger: logger,

@@ -347,6 +347,8 @@ public final class PostgresConnection: @unchecked Sendable {
 
     func withTraceContextOverride<T>(
         _ context: ServiceContext?,
+        // Preserve the caller's actor isolation while forwarding a transaction closure through this helper.
+        isolation: isolated (any Actor)? = #isolation,
         _ body: () async throws -> sending T
     ) async rethrows -> sending T {
         guard let traceContextOverride = self.traceContextOverride else {
@@ -857,7 +859,7 @@ extension PostgresConnection {
             )
         }
 
-        return try await self.withTraceContextOverride(span.context) {
+        return try await self.withTraceContextOverride(span.context, isolation: isolation) {
             do {
                 let result = try await self._withTransactionUntraced(
                     logger: logger,
