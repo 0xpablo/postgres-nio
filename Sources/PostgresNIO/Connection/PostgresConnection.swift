@@ -7,6 +7,7 @@ import NIOTransportServices
 #endif
 import NIOSSL
 import Logging
+import Tracing
 
 /// A Postgres connection. Use it to run queries against a Postgres server.
 ///
@@ -48,11 +49,25 @@ public final class PostgresConnection: @unchecked Sendable {
     public let id: ID
 
     private var _logger: Logger
+    private let tracingConfiguration: PostgresTracingConfiguration?
+    private let tracingConnectionInfo: PostgresTracingConnectionInfo?
+    private let traceContextOverride: NIOLockedValueBox<ServiceContext?>?
 
-    init(channel: any Channel, connectionID: ID, logger: Logger) {
+    init(
+        channel: any Channel,
+        connectionID: ID,
+        logger: Logger,
+        tracingConfiguration: PostgresTracingConfiguration?,
+        tracingConnectionInfo: PostgresTracingConnectionInfo?
+    ) {
         self.channel = channel
         self.id = connectionID
         self._logger = logger
+        self.tracingConfiguration = tracingConfiguration
+        self.tracingConnectionInfo = tracingConnectionInfo
+        self.traceContextOverride = tracingConfiguration.map { _ in
+            NIOLockedValueBox<ServiceContext?>(nil)
+        }
     }
     deinit {
         assert(self.isClosed, "PostgresConnection deinitialized before being closed.")
@@ -202,8 +217,18 @@ public final class PostgresConnection: @unchecked Sendable {
                     )
                 }
 
-                let connection = PostgresConnection(channel: channel, connectionID: connectionID, logger: logger)
-                return connection.start(configuration: configuration).map { _ in
+                let tracingConfiguration = configuration.options.tracing.isEnabled ? configuration.options.tracing : nil
+                let tracingConnectionInfo = tracingConfiguration.map { _ in
+                    PostgresTracingConnectionInfo(configuration: configuration)
+                }
+                let connection = PostgresConnection(
+                    channel: channel,
+                    connectionID: connectionID,
+                    logger: logger,
+                    tracingConfiguration: tracingConfiguration,
+                    tracingConnectionInfo: tracingConnectionInfo
+                )
+                return connection.start(configuration: configuration).map {
                     timeoutTask.cancel()
                     return connection
                 }.flatMapError { error in
@@ -240,6 +265,175 @@ public final class PostgresConnection: @unchecked Sendable {
         }
 
         fatalError("No matching bootstrap found")
+    }
+
+    func makeTraceSpan(
+        for operation: @autoclosure () -> PostgresTraceOperation,
+        parentContext: ServiceContext? = nil,
+        function: String = #function,
+        file: String = #fileID,
+        line: UInt = #line
+    ) -> PostgresTraceSpan? {
+        guard let configuration = self.tracingConfiguration,
+              let connectionInfo = self.tracingConnectionInfo,
+              let tracer = configuration.resolvedTracer
+        else {
+            return nil
+        }
+
+        let resolvedParentContext = parentContext
+            ?? self.traceContextOverride?.withLockedValue { $0 }
+            ?? ServiceContext.current
+
+        return operation().makeSpan(
+            tracer: tracer,
+            configuration: configuration,
+            connectionInfo: connectionInfo,
+            parentContext: resolvedParentContext,
+            function: function,
+            file: file,
+            line: line
+        )
+    }
+
+    func makeQueryTraceSpan(
+        for query: PostgresQuery,
+        parentContext: ServiceContext? = nil,
+        function: String = #function,
+        file: String = #fileID,
+        line: UInt = #line
+    ) -> PostgresTraceSpan? {
+        self.makeTraceSpan(
+            for: .userQuery(query),
+            parentContext: parentContext,
+            function: function,
+            file: file,
+            line: line
+        )
+    }
+
+    func makePreparedExecutionTraceSpan(
+        sql: String,
+        bindCount: Int,
+        parentContext: ServiceContext? = nil,
+        function: String = #function,
+        file: String = #fileID,
+        line: UInt = #line
+    ) -> PostgresTraceSpan? {
+        self.makeTraceSpan(
+            for: .preparedExecution(sql: sql, bindCount: bindCount),
+            parentContext: parentContext,
+            function: function,
+            file: file,
+            line: line
+        )
+    }
+
+    func makePrepareTraceSpan(
+        sql: String,
+        parentContext: ServiceContext? = nil,
+        function: String = #function,
+        file: String = #fileID,
+        line: UInt = #line
+    ) -> PostgresTraceSpan? {
+        self.makeTraceSpan(
+            for: .prepare(sql: sql),
+            parentContext: parentContext,
+            function: function,
+            file: file,
+            line: line
+        )
+    }
+
+    func withTraceContextOverride<T>(
+        _ context: ServiceContext?,
+        _ body: () async throws -> sending T
+    ) async rethrows -> sending T {
+        guard let traceContextOverride = self.traceContextOverride else {
+            return try await body()
+        }
+
+        let previous = traceContextOverride.withLockedValue { value -> ServiceContext? in
+            let previous = value
+            value = context
+            return previous
+        }
+        defer {
+            traceContextOverride.withLockedValue {
+                $0 = previous
+            }
+        }
+        return try await body()
+    }
+
+    var shouldCreateTraceSpans: Bool {
+        guard let configuration = self.tracingConfiguration,
+              let _ = self.tracingConnectionInfo,
+              let _ = configuration.resolvedTracer
+        else {
+            return false
+        }
+        return true
+    }
+
+    var shouldBuildSafeLibraryGeneratedQueryText: Bool {
+        self.shouldCreateTraceSpans && self.tracingConfiguration?.queryTextPolicy == .safe
+    }
+
+    private func traceFuture<Value>(
+        _ future: EventLoopFuture<Value>,
+        span: PostgresTraceSpan?
+    ) -> EventLoopFuture<Value> {
+        guard let span else {
+            return future
+        }
+        future.whenComplete { result in
+            switch result {
+            case .success:
+                span.succeed()
+            case .failure(let error):
+                span.fail(error)
+            }
+        }
+        return future
+    }
+
+    /// Internal pool-maintenance query path that deliberately bypasses distributed tracing.
+    func runMaintenanceQuery(
+        _ query: PostgresQuery,
+        logger: Logger,
+        file: String = #fileID,
+        line: Int = #line
+    ) async throws {
+        let future = self.queryStream(query, logger: logger).flatMap { rowStream in
+            rowStream.all().flatMapThrowing { rows -> PostgresQueryResult in
+                guard let metadata = PostgresQueryMetadata(string: rowStream.commandTag) else {
+                    throw PSQLError.invalidCommandTag(rowStream.commandTag)
+                }
+                return PostgresQueryResult(metadata: metadata, rows: rows)
+            }
+        }.enrichPSQLError(query: query, file: file, line: line)
+        _ = try await future.get()
+    }
+
+    func tracedDeallocate(
+        _ statementName: String,
+        logger: Logger,
+        file: String = #fileID,
+        line: Int = #line
+    ) -> EventLoopFuture<Void> {
+        var logger = logger
+        logger[postgresMetadataKey: .connectionID] = "\(self.id)"
+
+        let span = self.makeTraceSpan(
+            for: .deallocate(statementName: statementName),
+            file: file,
+            line: UInt(line)
+        )
+        return self.traceFuture(
+            self.close(.preparedStatement(statementName), logger: logger),
+            span: span
+        )
     }
 
     // MARK: Query
@@ -457,26 +651,32 @@ extension PostgresConnection {
     ) async throws -> PostgresRowSequence {
         var logger = logger
         logger[postgresMetadataKey: .connectionID] = "\(self.id)"
-
-        guard query.binds.count <= Int(UInt16.max) else {
-            throw PSQLError(code: .tooManyParameters, query: query, file: file, line: line)
-        }
-        let promise = self.channel.eventLoop.makePromise(of: PSQLRowStream.self)
-        let context = ExtendedQueryContext(
-            query: query,
-            logger: logger,
-            promise: promise
-        )
-
-        self.channel.write(HandlerTask.extendedQuery(context), promise: nil)
-
+        let span = self.makeQueryTraceSpan(for: query, file: file, line: UInt(line))
         do {
-            return try await promise.futureResult.map({ $0.asyncSequence() }).get()
-        } catch var error as PSQLError {
-            error.file = file
-            error.line = line
-            error.query = query
-            throw error // rethrow with more metadata
+            guard query.binds.count <= Int(UInt16.max) else {
+                throw PSQLError(code: .tooManyParameters, query: query, file: file, line: line)
+            }
+            let promise = self.channel.eventLoop.makePromise(of: PSQLRowStream.self)
+            let context = ExtendedQueryContext(
+                query: query,
+                logger: logger,
+                promise: promise
+            )
+
+            self.channel.write(HandlerTask.extendedQuery(context), promise: nil)
+
+            let responseFuture = promise.futureResult.flatMapThrowing { rowStream in
+                if let span {
+                    rowStream.installTracing(span, managesLifecycle: true)
+                }
+                return rowStream.asyncSequence()
+            }
+
+            return try await responseFuture.get()
+        } catch {
+            let tracedError = enrichTracingError(error, query: query, file: file, line: line)
+            span?.fail(tracedError)
+            throw tracedError
         }
     }
 
@@ -545,6 +745,12 @@ extension PostgresConnection {
         line: Int = #line
     ) async throws -> AsyncThrowingMapSequence<PostgresRowSequence, Row> where Row == Statement.Row {
         let bindings = try preparedStatement.makeBindings()
+        let span = self.makePreparedExecutionTraceSpan(
+            sql: Statement.sql,
+            bindCount: bindings.count,
+            file: file,
+            line: UInt(line)
+        )
         let promise = self.channel.eventLoop.makePromise(of: PSQLRowStream.self)
         let task = HandlerTask.executePreparedStatement(.init(
             name: Statement.name,
@@ -555,19 +761,23 @@ extension PostgresConnection {
             promise: promise
         ))
         self.channel.write(task, promise: nil)
+        let responseFuture = promise.futureResult.flatMapThrowing { rowStream in
+            if let span {
+                rowStream.installTracing(span, managesLifecycle: true)
+            }
+            return rowStream.asyncSequence()
+        }
         do {
-            return try await promise.futureResult
-                .map { $0.asyncSequence() }
-                .get()
-                .map { try preparedStatement.decodeRow($0) }
-        } catch var error as PSQLError {
-            error.file = file
-            error.line = line
-            error.query = .init(
-                unsafeSQL: Statement.sql,
-                binds: bindings
+            return try await responseFuture.get().map { try preparedStatement.decodeRow($0) }
+        } catch {
+            let tracedError = enrichTracingError(
+                error,
+                query: .init(unsafeSQL: Statement.sql, binds: bindings),
+                file: file,
+                line: line
             )
-            throw error // rethrow with more metadata
+            span?.fail(tracedError)
+            throw tracedError
         }
     }
 
@@ -580,6 +790,12 @@ extension PostgresConnection {
         line: Int = #line
     ) async throws -> String where Statement.Row == () {
         let bindings = try preparedStatement.makeBindings()
+        let span = self.makePreparedExecutionTraceSpan(
+            sql: Statement.sql,
+            bindCount: bindings.count,
+            file: file,
+            line: UInt(line)
+        )
         let promise = self.channel.eventLoop.makePromise(of: PSQLRowStream.self)
         let task = HandlerTask.executePreparedStatement(.init(
             name: Statement.name,
@@ -590,18 +806,20 @@ extension PostgresConnection {
             promise: promise
         ))
         self.channel.write(task, promise: nil)
+        let responseFuture = promise.futureResult.map { $0.commandTag }
         do {
-            return try await promise.futureResult
-                .map { $0.commandTag }
-                .get()
-        } catch var error as PSQLError {
-            error.file = file
-            error.line = line
-            error.query = .init(
-                unsafeSQL: Statement.sql,
-                binds: bindings
+            let commandTag = try await responseFuture.get()
+            span?.succeed()
+            return commandTag
+        } catch {
+            let tracedError = enrichTracingError(
+                error,
+                query: .init(unsafeSQL: Statement.sql, binds: bindings),
+                file: file,
+                line: line
             )
-            throw error // rethrow with more metadata
+            span?.fail(tracedError)
+            throw tracedError
         }
     }
 
@@ -622,6 +840,42 @@ extension PostgresConnection {
     ///              The connection must stay in the transaction mode. Otherwise this method will throw!
     /// - Returns: The closure's return value.
     public func withTransaction<Result>(
+        logger: Logger,
+        file: String = #file,
+        line: Int = #line,
+        isolation: isolated (any Actor)? = #isolation,
+        _ process: (PostgresConnection) async throws -> sending Result
+    ) async throws -> sending Result {
+        let span = self.makeTraceSpan(for: .transaction, file: file, line: UInt(line))
+        guard let span else {
+            return try await self._withTransactionUntraced(
+                logger: logger,
+                file: file,
+                line: line,
+                isolation: isolation,
+                process
+            )
+        }
+
+        return try await self.withTraceContextOverride(span.context) {
+            do {
+                let result = try await self._withTransactionUntraced(
+                    logger: logger,
+                    file: file,
+                    line: line,
+                    isolation: isolation,
+                    process
+                )
+                span.succeed()
+                return result
+            } catch {
+                span.fail(error)
+                throw error
+            }
+        }
+    }
+
+    func _withTransactionUntraced<Result>(
         logger: Logger,
         file: String = #file,
         line: Int = #line,
@@ -676,7 +930,8 @@ extension PostgresConnection {
         file: String = #fileID,
         line: Int = #line
     ) -> EventLoopFuture<PostgresQueryResult> {
-        self.queryStream(query, logger: logger).flatMap { rowStream in
+        let span = self.makeQueryTraceSpan(for: query, file: file, line: UInt(line))
+        let future = self.queryStream(query, logger: logger).flatMap { rowStream in
             rowStream.all().flatMapThrowing { rows -> PostgresQueryResult in
                 guard let metadata = PostgresQueryMetadata(string: rowStream.commandTag) else {
                     throw PSQLError.invalidCommandTag(rowStream.commandTag)
@@ -684,6 +939,7 @@ extension PostgresConnection {
                 return PostgresQueryResult(metadata: metadata, rows: rows)
             }
         }.enrichPSQLError(query: query, file: file, line: line)
+        return self.traceFuture(future, span: span)
     }
 
     /// Run a query on the Postgres server the connection is connected to and iterate the rows in a callback.
@@ -705,14 +961,19 @@ extension PostgresConnection {
         line: Int = #line,
         _ onRow: @escaping @Sendable (PostgresRow) throws -> ()
     ) -> EventLoopFuture<PostgresQueryMetadata> {
-        self.queryStream(query, logger: logger).flatMap { rowStream in
-            rowStream.onRow(onRow).flatMapThrowing { () -> PostgresQueryMetadata in
+        let span = self.makeQueryTraceSpan(for: query, file: file, line: UInt(line))
+        let future: EventLoopFuture<PostgresQueryMetadata> = self.queryStream(query, logger: logger).flatMap { rowStream in
+            if let span {
+                rowStream.installTracing(span, managesLifecycle: false)
+            }
+            return rowStream.onRow(onRow).flatMapThrowing { () -> PostgresQueryMetadata in
                 guard let metadata = PostgresQueryMetadata(string: rowStream.commandTag) else {
                     throw PSQLError.invalidCommandTag(rowStream.commandTag)
                 }
                 return metadata
             }
         }.enrichPSQLError(query: query, file: file, line: line)
+        return self.traceFuture(future, span: span)
     }
 }
 
@@ -727,27 +988,66 @@ extension PostgresConnection: PostgresDatabase {
             preconditionFailure("\(#function) requires an instance of PostgresCommands. This will be a compile-time error in the future.")
         }
 
-        let resultFuture: EventLoopFuture<Void>
-
         switch command {
         case .query(let query, let onMetadata, let onRow):
-            resultFuture = self.queryStream(query, logger: logger).flatMap { stream in
+            let span = self.makeQueryTraceSpan(for: query)
+            let resultFuture = self.queryStream(query, logger: logger).flatMap { stream in
+                if let span {
+                    stream.installTracing(span, managesLifecycle: false)
+                }
                 return stream.onRow(onRow).map { _ in
-                    onMetadata(PostgresQueryMetadata(string: stream.commandTag)!)
+                    let metadata = PostgresQueryMetadata(string: stream.commandTag)!
+                    if let span {
+                        span.withContext {
+                            onMetadata(metadata)
+                        }
+                    } else {
+                        onMetadata(metadata)
+                    }
                 }
             }
+            return self.traceFuture(
+                resultFuture.flatMapErrorThrowing { error in
+                    throw error.asAppropriatePostgresError
+                },
+                span: span
+            )
 
         case .queryAll(let query, let onResult):
-            resultFuture = self.queryStream(query, logger: logger).flatMap { rows in
+            let span = self.makeQueryTraceSpan(for: query)
+            let resultFuture = self.queryStream(query, logger: logger).flatMap { rows in
                 return rows.all().map { allrows in
-                    onResult(.init(metadata: PostgresQueryMetadata(string: rows.commandTag)!, rows: allrows))
+                    let result = PostgresQueryResult(
+                        metadata: PostgresQueryMetadata(string: rows.commandTag)!,
+                        rows: allrows
+                    )
+                    if let span {
+                        span.withContext {
+                            onResult(result)
+                        }
+                    } else {
+                        onResult(result)
+                    }
                 }
             }
+            return self.traceFuture(
+                resultFuture.flatMapErrorThrowing { error in
+                    throw error.asAppropriatePostgresError
+                },
+                span: span
+            )
 
         case .prepareQuery(let request):
-            resultFuture = self.prepareStatement(request.query, with: request.name, logger: logger).map {
+            let span = self.makePrepareTraceSpan(sql: request.query)
+            let resultFuture = self.prepareStatement(request.query, with: request.name, logger: logger).map {
                 request.prepared = PreparedQuery(underlying: $0, database: self)
             }
+            return self.traceFuture(
+                resultFuture.flatMapErrorThrowing { error in
+                    throw error.asAppropriatePostgresError
+                },
+                span: span
+            )
 
         case .executePreparedStatement(let preparedQuery, let binds, let onRow):
             var bindings = PostgresBindings(capacity: binds.count)
@@ -759,13 +1059,22 @@ extension PostgresConnection: PostgresDatabase {
                 rowDescription: preparedQuery.underlying.rowDescription
             )
 
-            resultFuture = self.execute(statement, logger: logger).flatMap { rows in
+            let span = self.makePreparedExecutionTraceSpan(
+                sql: preparedQuery.underlying.query,
+                bindCount: binds.count
+            )
+            let resultFuture = self.execute(statement, logger: logger).flatMap { rows in
+                if let span {
+                    rows.installTracing(span, managesLifecycle: false)
+                }
                 return rows.onRow(onRow)
             }
-        }
-
-        return resultFuture.flatMapErrorThrowing { error in
-            throw error.asAppropriatePostgresError
+            return self.traceFuture(
+                resultFuture.flatMapErrorThrowing { error in
+                    throw error.asAppropriatePostgresError
+                },
+                span: span
+            )
         }
     }
 
