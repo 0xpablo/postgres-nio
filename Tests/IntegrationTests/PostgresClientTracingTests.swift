@@ -12,6 +12,7 @@ final class PostgresClientTracingTests: XCTestCase {
         var rawLogger = Logger(label: "PostgresClientTracingTests")
         rawLogger.logLevel = .debug
         let logger = rawLogger
+        let query: PostgresQuery = "SELECT 1;"
 
         try await self.withEventLoopGroup { eventLoopGroup in
             try await self.verifyDatabaseAccess(on: eventLoopGroup)
@@ -29,37 +30,51 @@ final class PostgresClientTracingTests: XCTestCase {
                     await client.run()
                 }
 
-                let firstTask = Task {
-                    let rows = try await client.query("SELECT pg_sleep(0.3);", logger: logger)
+                let (leaseAcquiredStream, leaseAcquiredContinuation) = AsyncStream.makeStream(of: Void.self)
+                let (releaseLeaseStream, releaseLeaseContinuation) = AsyncStream.makeStream(of: Void.self)
+                let leaseTask = Task {
+                    try await client.withConnection { _ in
+                        leaseAcquiredContinuation.yield()
+                        leaseAcquiredContinuation.finish()
+
+                        var releaseLeaseIterator = releaseLeaseStream.makeAsyncIterator()
+                        await releaseLeaseIterator.next()
+                    }
+                }
+
+                var leaseAcquiredIterator = leaseAcquiredStream.makeAsyncIterator()
+                await leaseAcquiredIterator.next()
+
+                let queryTask = Task {
+                    let rows = try await client.query(query, logger: logger)
                     for try await _ in rows {}
                 }
 
-                try await Task.sleep(for: .milliseconds(50))
-
-                let secondTask = Task {
-                    let rows = try await client.query("SELECT 1;", logger: logger)
-                    for try await _ in rows {}
+                let didStartQuerySpan = try await self.waitForActiveSpan(withQueryText: query.sql, in: tracer)
+                if didStartQuerySpan {
+                    try await Task.sleep(for: .milliseconds(100))
                 }
 
-                try await firstTask.value
-                try await secondTask.value
+                releaseLeaseContinuation.yield()
+                releaseLeaseContinuation.finish()
+
+                try await leaseTask.value
+                try await queryTask.value
 
                 group.cancelAll()
+
+                XCTAssertTrue(didStartQuerySpan)
             }
         }
 
-        let sleepSpan = try XCTUnwrap(tracer.finishedSpans.first(where: {
-            $0.attributes.stringValue(for: "db.query.text") == "SELECT pg_sleep(0.3);"
-        }))
-        let secondSpan = try XCTUnwrap(tracer.finishedSpans.first(where: {
-            $0.attributes.stringValue(for: "db.query.text") == "SELECT 1;"
+        let querySpan = try XCTUnwrap(tracer.finishedSpans.first(where: {
+            $0.attributes.stringValue(for: "db.query.text") == query.sql
         }))
 
-        XCTAssertEqual(sleepSpan.kind, SpanKind.client)
-        XCTAssertEqual(secondSpan.kind, SpanKind.client)
+        XCTAssertEqual(querySpan.kind, SpanKind.client)
 
-        let duration = secondSpan.endInstant.nanosecondsSinceEpoch - secondSpan.startInstant.nanosecondsSinceEpoch
-        XCTAssertGreaterThanOrEqual(duration, 200_000_000)
+        let duration = querySpan.endInstant.nanosecondsSinceEpoch - querySpan.startInstant.nanosecondsSinceEpoch
+        XCTAssertGreaterThanOrEqual(duration, 80_000_000)
     }
 
     func testTransactionTracingParentsDatabaseSpans() async throws {
@@ -253,6 +268,21 @@ final class PostgresClientTracingTests: XCTestCase {
     ) async throws -> Bool {
         for _ in 0..<50 {
             if tracer.finishedSpans.contains(where: {
+                $0.attributes.stringValue(for: "db.query.text") == queryText
+            }) {
+                return true
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        return false
+    }
+
+    private func waitForActiveSpan(
+        withQueryText queryText: String,
+        in tracer: InMemoryTracer
+    ) async throws -> Bool {
+        for _ in 0..<50 {
+            if tracer.activeSpans.contains(where: {
                 $0.attributes.stringValue(for: "db.query.text") == queryText
             }) {
                 return true
